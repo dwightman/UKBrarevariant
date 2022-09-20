@@ -1,0 +1,190 @@
+#################### example script to make phenotype and covariates #######
+
+#need these data fields from UKB
+#get parental AD status, fage, faged, mage, maged
+20107	Illness of Father
+20110	Illness of Mother
+1807	Father's age at death
+2946	Father's age
+3526	Mother's age at death
+1845	Mother's age
+
+
+#column numbers
+#faged= 41-44
+#mage=45-48
+#fage=57-60
+#maged=61-64
+#illFather=65-104
+#illMother=105-148
+
+#get all phenos
+zcat phenos.txt.gz | cut -f1,2,41-44,45-48,57-60,61-64 > agepheno.txt
+
+#paternal, 10 represents is alzheimer's disease /dementia
+zcat phenos.txt.gz | cut -f1,65-104 | sed 's/\t/ /g' | grep -w "10" | cut -d' ' -f1 | grep -v "f.eid" > paternalproxycases.txt
+#23366
+
+#maternal
+zcat phenos.txt.gz | cut -f1,105-148 | sed 's/\t/ /g' | grep -w "10" | cut -d' ' -f1 | grep -v "f.eid" > maternalproxycases.txt
+#44088
+
+#genotyped individual status
+41270	Diagnosis ICD10
+41202	Diagnosis main
+41204	Diagnosis secondary
+
+#G30 AD, G300 early onset, G301 AD late, G308 other AD, G309 AD unspecified
+#also F00 dementia in AD, F000 early onset, F001 late, F002 other, F009 unspecified
+
+#diagnosis main
+cut -f1,201-266 phenos.txt | sed 's/\t/ /g' | grep " G30" | cut -d' ' -f1 > ADcasesmain.txt
+cut -f1,201-266 phenos.txt | sed 's/\t/ /g' | grep " F00" | cut -d' ' -f1 > dementiaADcasesmain.txt
+
+#dignosis secondary
+cut -f1,267-450 phenos.txt | sed 's/\t/ /g' | grep " G30" | cut -d' ' -f1 > ADcasesecond.txt
+cut -f1,267-450 phenos.txt | sed 's/\t/ /g' | grep " F00" | cut -d' ' -f1 > dementiaADcasessecond.txt
+
+#diagnosis ICD10
+cut -f1,451-663 phenos.txt | sed 's/\t/ /g' | grep " G30" | cut -d' ' -f1 > ADcasesICD10.txt
+cut -f1,451-663 phenos.txt | sed 's/\t/ /g' | grep " F00" | cut -d' ' -f1 > dementiaADcasesICD10.txt
+
+#find cases
+cat dementiaADcasesmain.txt ADcasesmain.txt ADcasesecond.txt dementiaADcasessecond.txt ADcasesICD10.txt dementiaADcasesICD10.txt | sort | uniq > probandADdiagnosed.txt
+
+
+
+#anyone who reported a parent who is younger than 40 or died <40 is set to missing
+#all people with one missing parents age and the other is a control are set to missing
+#all people with one missing parent age and the other is a case are set to 1
+cat  > makepheno.R < END
+library(data.table)
+pat<-fread("paternalproxycases.txt", header=F)
+mat<-fread("maternalproxycases.txt", header=F)
+exo<-fread("allpeople.txt", header=F)
+exo$m<-0
+exo$p<-0
+exo$p[exo$V1 %in% pat$V1] <- exo$p[exo$V1 %in% pat$V1] + 1
+exo$m[exo$V1 %in% mat$V1] <- exo$m[exo$V1 %in% mat$V1] + 1
+table(exo$p)
+table(exo$m)
+
+rm(pat)
+rm(mat)
+
+#read in ages
+ages<-fread("agepheno.txt")
+
+#convert NA to -1000
+ages[is.na(ages)]<- -1000
+
+#get fathers oldest age and age of death
+ages$faged<-apply(X=ages[,3:6], MARGIN=1, FUN=max)
+ages$fage<-apply(X=ages[,11:14], MARGIN=1, FUN=max)
+table(ages$faged)
+table(ages$fage)
+
+
+#set faged<40 and fage <40 to -1000
+ages$faged[ages$faged<40]<--1000
+ages$fage[ages$fage<40]<--1000
+table(ages$faged)
+table(ages$fage)
+
+#get the oldest age of faged and fage
+ages$ffage<-apply(X=ages[,19:20], MARGIN=1, FUN=max)
+table(ages$ffage)
+
+#Repeat with mother
+ages$maged<-apply(X=ages[,15:18], MARGIN=1, FUN=max)
+ages$mage<-apply(X=ages[,7:10], MARGIN=1, FUN=max)
+table(ages$maged)
+table(ages$mage)
+ages$maged[ages$maged<40]<--1000
+ages$mage[ages$mage<40]<--1000
+table(ages$maged)
+table(ages$mage)
+ages$fmage<-apply(X=ages[,22:23], MARGIN=1, FUN=max)
+table(ages$fmage)
+
+
+#if people with parental oldest age <40 then set their phenotype to missing
+all(exo$V1==ages$f.eid)
+exo$mp<-exo$m
+exo$mp[ages$fmage<40]<- -9
+
+
+exo$fp<-exo$p
+exo$fp[ages$ffage<40]<- -9
+
+
+#weight controls and limit contribution to 0.32. missing people will have value of 11, people with oldest age >100 will have negative value. So convert negative to 0 and 11 to missing -9
+exo$conm<-((100-ages$fmage)/100)
+table(exo$conm)
+exo$conm[exo$conm<0]<- 0
+exo$conm[exo$conm==11]<- -9
+exo$conm[exo$conm>0.32]<-0.32
+table(exo$conm)
+
+exo$conf<-((100-ages$ffage)/100)
+table(exo$conf)
+exo$conf[exo$conf<0]<- 0
+exo$conf[exo$conf==11]<- -9
+exo$conf[exo$conf>0.32]<-0.32
+table(exo$conf)
+
+#combine phenotype. missing info for one parent but case for other will be treated as a 1 parent. Missing info for one parent but control in the other will be treated as missing
+#weiged controls for all people so one parent as a case and one as a control will be between 1-1.32
+exo$Phenotype<-exo$fp+exo$mp
+exo$Phenotype[exo$Phenotype==-8]<-1
+exo$Phenotype[exo$Phenotype==-18]<--9
+#weight controls by parental age
+exo$Phenotype[exo$Phenotype==0]<-exo$conm[exo$Phenotype==0]+exo$conf[exo$Phenotype==0]
+#weight people with one case parent
+exo$Phenotype[exo$mp==1 & !exo$fp==1]<-1+exo$conf[exo$mp==1 & !exo$fp==1]
+exo$Phenotype[exo$fp==1 & !exo$mp==1]<-1+exo$conm[exo$fp==1 & !exo$mp==1]
+
+#make proband diagnosis for ad or dementia a 2
+pdem<-fread("probandADdiagnosed.txt", header=F)
+exo$Phenotype[exo$V1 %in% pdem$V1]<-2
+
+exo$Phenotype[exo$Phenotype<0]<--9
+
+exo<-exo[exo$Phenotype>=0,]
+exo<-exo[,c(1,1,8)]
+colnames(exo)<-c("FID","IID","Phenotype")
+fwrite(exo, "ADproxyQCphenotyped.txt", row.names=F, col.names=T, quote=F, na=NA, sep="\t")
+END
+
+Rscript makepheno.R
+
+
+
+################## make covars ############################################
+#need sex, wes batch, and age
+#31	Discrete covar, self-reported sex
+
+cat > covar.R < END
+library(data.table)
+a<-fread("batch.txt",header=T)
+a[,wesbatch01:=as.numeric(as.factor(wes_batch))-1]
+
+c<-fread("plink_covars.txt", header=T)
+a<-a[a$f.eid %in% c$FID,]
+
+all(a$f.eid==c$FID)
+c$wesbatch01<-a$wesbatch01
+fwrite(c, "plink_covars.txt", sep="\t", col.names=T, row.names=F, na=NA, quote=F)
+END
+
+Rscript covar.R
+
+
+
+
+
+
+
+
+
+

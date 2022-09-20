@@ -1,0 +1,323 @@
+######## example bash script to annotate variants #########################
+
+
+#Start with unrelated EUR exome file
+#use plink to excluded variants which failed QC and people who opt out, as well as mtDNA
+module load 2019
+module load PLINK/1.9b_6.17-x86_64-GCC-8.3.0
+plink --bfile unrelated_wes_200k_EUR --exclude defaultVariantExclusions.txt --not-chr 25 --remove defaultSubjectExclusions.txt --make-bed --out e200k
+
+
+#get frequency of variants and identify the minor allele
+plink --bfile e200k --freq --out e200k
+gzip e200k*
+
+
+########### MAKE SETID for pLOF category ################################################
+
+#format into VEP format
+zcat e200k.frq.gz | tail -n +2 |  awk '{if ($5>0) print $2,$1,$2,$3,$4,$5,$6}' | sed 's/:/\t/1' | sed 's/:/\t/1' | awk '{print $1,$2,$5,$7,$6,".","."}' > SNPs4VEP.txt
+
+#annotate with VEP to LOF variants
+vep --cache -i SNPs4VEP.txt --vcf --fields "Allele,Consequence,Gene" -o SNPanno.vcf
+filter_vep -i SNPanno.vcf -o LOF.txt -filter "Consequence is start_lost or Consequence is stop_lost or Consequence is frameshift_variant or Consequence is stop_gained or Consequence is splice_donor_variant or Consequence is splice_acceptor_variant or Consequence is transcript_ablation" --only_matched
+
+
+#get LOF variants
+tail -n +5 LOF.txt | awk '{print $3}' > LOFvariants.txt
+tail -n +5 ${i}LOF.txt | cut -f8 | cut -d'|' -f1 | sed 's/CSQ=//g' > LOFtestedalleles.txt
+paste LOFvariants.txt LOFtestedalleles.txt > LOFvariantsAlleles.txt
+
+
+#make a wide format snpmap
+tail -n +5 LOF.txt | awk -v OFS="" '{print $3,"|",$8}' | sed 's/,/|/g' | cut -d'|' -f 1,$(seq 4 3 1200 | tr '\n' ',' | sed 's/,$//g') | sed 's/|/ /g' > VEPsnpmapwide.txt
+
+#make long format snpmap
+cat >  makelongVEP.R << END
+args = commandArgs(trailingOnly=TRUE)
+#read in wide map with the right number of columns
+a<-read.table(args[1], header = FALSE, sep = " ", col.names = paste0("V",seq_len(args[2])), fill = TRUE)
+#make sure gene and snp names are not factors
+a<-data.frame(lapply(a, as.character), stringsAsFactors=FALSE)
+
+#melt the data to gene snp for skat.setID
+library(data.table)
+b<- melt(a, id.vars="V1")
+rm(a)
+#Remove the NAs because lots of columns will be empty
+b<-b[!b$value=="",] 
+#get genes and snp, order by gene and make there be one gene per row
+b<-b[,c(3,1)]
+b<-b[order(b$value),]
+#remove duplicate lines
+b<-unique(b)
+fwrite(b,file=args[3], col.names=F, row.names=F, sep="\t", na=NA, quote=F)
+END
+
+#find how many columns in wide format
+col=$(awk '{print NF}' VEPsnpmapwide.txt | sort -nu | tail -n 1)
+echo $col
+Rscript makelongVEP.R VEPsnpmapwide.txt $col VEPsnpmaplong.txt
+
+#give the full allele tested name 
+sed 's/:/\t/g' LOFvariantsAlleles.txt | sed 's/_/\t/g' | awk '{l=length($4)-length($5);if (l==1) print $1,$2,$3,$4,$4,$5; else print $1,$2,$3,$4,$5,$5}' | awk '{if ($6=="-") print $1,$2,$3,$4,$3; else print $1,$2,$3,$4,$5}' | sed 's/ /:/1' | sed 's/ /:/1' | sed 's/ /_/1' > LOFvariantsAlleles.txt1
+
+mv LOFvariantsAlleles.txt incorrectA2LOFvariantsAlleles.txt 
+mv LOFvariantsAlleles.txt1 LOFvariantsAlleles.txt
+
+#get rare variants when the restricted to people included in SKAT-O analysis
+#make this file by re-running above plink command except restrict to people of interest
+cat e200knoMissing.frq | tail -n +2 |  awk '{if ($5>0) print}' | awk '{if ($5<0.01) print $2}' > rarevariants.txt
+
+#make setID
+zcat VEPsnpmaplong.txt.gz | grep -w -f rarevariants.txt > rareSKAT.setID
+
+#change snp names that are too long
+awk '{print $2}' rareSKAT.setID | grep -e ".\{35\}" | wc -l
+#963
+#lets change their names to longsnp1...longsnp995
+awk '{print $2}' rareSKAT.setID | grep -e ".\{35\}" > tmp1
+for i in {1..963}; do echo "longsnp${i}" >> tmp2; done
+paste tmp1 tmp2 > longsnpnamescode.txt
+rm tmp1
+rm tmp2
+
+#change the names in the skat setid
+awk '{print $1}' longsnpnamescode.txt > toolongsnpnames.txt
+awk '{print $2}' longsnpnamescode.txt > trimmedsnpnames.txt
+
+awk '
+    FILENAME == ARGV[1] { listA[$1] = FNR; next }
+    FILENAME == ARGV[2] { listB[FNR] = $1; next }
+    {
+        for (i = 1; i <= NF; i++) {
+            if ($i in listA) {
+                $i = listB[listA[$i]]
+            }
+        }
+        print
+    }
+' toolongsnpnames.txt trimmedsnpnames.txt rareSKAT.setID > tmp.txt
+mv tmp.txt rareSKAT.setID
+
+
+#######################################  MAKE setID for HiCpLOF ########################
+
+
+#annotate LOF variants with LOFTEE
+awk '{print $1}' LOFvariantsAlleles.txt > tmp
+grep -w -f tmp SNPs4VEP.txt > LOFSNPs4VEP.txt
+
+vep --cache -i LOFSNPs4VEP.txt --vcf --fields "Allele,Consequence,Gene,LoF,LoF_filter,LoF_flags,LoF_info" -o LOFSNPannoLOFTEE.vcf --dir_plugin loftee --plugin LoF,loftee_path:loftee,human_ancestor_fa:human_ancestor.fa.gz,conservation_file:phylocsf_gerp.sql
+
+gzip LOFSNPannoLOFTEE.vcf
+gzip LOFSNPs4VEP.txt
+
+
+#Make snpmap
+#filter for the variants where they have HIC LOF
+filter_vep -i LOFSNPannoLOFTEE.vcf -o HICLOFSNP.txt -filter "LoF is HC" --only_matched
+
+#get the variants
+tail -n +9 LOFSNPannoLOFTEE.vcf | awk '{print $3,$5}' > HICLOFvariantsAlleles.txt
+
+#make the snpmap
+#get snp name and csq section then get every 4th cell (gene id) 
+tail -n +9 HICLOFSNP.txt | awk '{print $3,"|",$8}' | sed 's/,/|/g' | cut -d'|' -f1,$(seq 4 7 1900 | tr '\n' ',' | sed 's/,$//g') | sed 's/|/ /g' | sed 's/  / /g' > HICLOFmapwide.txt
+
+#see how many columns
+col=$(awk '{print NF}' HICLOFmapwide.txt | sort -nu | tail -n 1)
+echo $col
+Rscript makelongVEP.R HICLOFmapwide.txt $col HICLOFmaplong.txt
+
+#make setID
+zcat HICLOFmaplong.txt.gz | grep -w -f rarevariants.txt > rareSKAT.setID
+
+#lets see if the names are too long
+awk '{print $2}' rareSKAT.setID | grep -e ".\{35\}" | wc -l
+#698
+#lets change their names to longsnp1...longsnp995
+awk '{print $2}' rareSKAT.setID | grep -e ".\{35\}" > tmp1
+for i in {1..698}; do echo "longsnp${i}" >> tmp2; done
+paste tmp1 tmp2 > longsnpnamescode.txt
+rm tmp1
+rm tmp2
+
+#change the names in the skat setid
+awk '{print $1}' longsnpnamescode.txt > toolongsnpnames.txt
+awk '{print $2}' longsnpnamescode.txt > trimmedsnpnames.txt
+
+awk '
+    FILENAME == ARGV[1] { listA[$1] = FNR; next }
+    FILENAME == ARGV[2] { listB[FNR] = $1; next }
+    {
+        for (i = 1; i <= NF; i++) {
+            if ($i in listA) {
+                $i = listB[listA[$i]]
+            }
+        }
+        print
+    }
+' toolongsnpnames.txt trimmedsnpnames.txt rareSKAT.setID > tmp.txt
+mv tmp.txt rareSKAT.setID
+
+
+###################### MAKE pLOF+REVEL setID ######################################
+
+#annotate variants
+vep --cache -i ${1}_SNPs4VEP.txt -o SNPanno.vcf --plugin REVEL,new_tabbed_revel_grch38only.tsv.gz
+
+#get missense variants
+zcat *_SNPanno.vcf.gz | grep "REVEL=" | cut -f1,4,14 | sed 's/IMPACT.*REVEL=//g' | uniq > AllREVELmissense.txt
+
+#get REVEL >=0.5 variants
+awk '{if ($3>=0.5) print $1,$2}' AllREVELmissense.txt | sort -k2 | uniq > 5REVELmissense.txt
+
+#add LOF variants
+zcat VEPsnpmaplong.txt.gz > LOFrevel5.txt
+awk '{print $2,$1}' 5REVELmissense.txt >> LOFrevel5.txt
+
+sed -i 's/\t/ /g' LOFrevel5.txt 
+
+sort LOFrevel5.txt | uniq  > LOFrevel5.txt1
+mv LOFrevel5.txt1 LOFrevel5.txt
+
+#get tested variants
+grep -w -f rarevariants.txt LOFrevel5.txt | awk '{print $2}' | sort | uniq > tmp
+
+#get alleles
+zcat e200k.frq.gz | tail -n +2 | awk '{print $2,$3}' | grep -w -f tmp > REVELLOFvariantsAlleles.txt
+
+rm tmp
+
+grep -w -f rarevariants.txt LOFrevel5.txt > rareSKAT.setID
+
+
+#lets see if the names are too long
+awk '{print $2}' rareSKAT.setID | grep -e ".\{35\}" | wc -l
+#963
+#lets change their names to longsnp1...longsnp995
+awk '{print $2}' rareSKAT.setID | grep -e ".\{35\}" > tmp1
+for i in {1..963}; do echo "longsnp${i}" >> tmp2; done
+paste tmp1 tmp2 > longsnpnamescode.txt
+rm tmp1
+rm tmp2
+
+#change the names in the skat setid
+awk '{print $1}' longsnpnamescode.txt > toolongsnpnames.txt
+awk '{print $2}' longsnpnamescode.txt > trimmedsnpnames.txt
+
+awk '
+    FILENAME == ARGV[1] { listA[$1] = FNR; next }
+    FILENAME == ARGV[2] { listB[FNR] = $1; next }
+    {
+        for (i = 1; i <= NF; i++) {
+            if ($i in listA) {
+                $i = listB[listA[$i]]
+            }
+        }
+        print
+    }
+' toolongsnpnames.txt trimmedsnpnames.txt rareSKAT.setID > tmp.txt
+mv tmp.txt rareSKAT.setID
+
+
+
+########################### MAKE pLOF+Missense setID ################################
+
+#combined missense and pLOF
+awk '{print $1,$2}' AllREVELmissense.txt | sort -k2 | uniq > missense.txt
+zcat VEPsnpmaplong.txt.gz > LOFmissense.txt
+awk '{print $2,$1}' missense.txt >> LOFmissense.txt
+sed -i 's/\t/ /g' LOFmissense.txt
+
+sort LOFmissense.txt | uniq  > LOFmissense.txt1
+mv LOFmissense.txt1 LOFmissense.txt
+
+#get tested variants
+grep -w -f rarevariants.txt LOFmissense.txt | awk '{print $2}' | sort | uniq > tmp
+
+#get alleles
+zcat e200k.frq.gz | tail -n +2 | awk '{print $2,$3}' | grep -w -f tmp > REVELLOFvariantsAlleles.txt
+rm tmp
+
+
+#overlap rare variants with LOFmissense variants
+grep -w -f rarevariants.txt LOFmissense.txt > rareSKAT.setID
+
+
+#lets see if the names are too long
+awk '{print $2}' rareSKAT.setID | grep -e ".\{35\}" | wc -l
+#963
+#lets change their names to longsnp1...longsnp995
+awk '{print $2}' rareSKAT.setID | grep -e ".\{35\}" > tmp1
+for i in {1..963}; do echo "longsnp${i}" >> tmp2; done
+paste tmp1 tmp2 > longsnpnamescode.txt
+rm tmp1
+rm tmp2
+
+#change the names in the skat setid
+awk '{print $1}' longsnpnamescode.txt > toolongsnpnames.txt
+awk '{print $2}' longsnpnamescode.txt > trimmedsnpnames.txt
+
+awk '
+    FILENAME == ARGV[1] { listA[$1] = FNR; next }
+    FILENAME == ARGV[2] { listB[FNR] = $1; next }
+    {
+        for (i = 1; i <= NF; i++) {
+            if ($i in listA) {
+                $i = listB[listA[$i]]
+            }
+        }
+        print
+    }
+' toolongsnpnames.txt trimmedsnpnames.txt rareSKAT.setID > tmp.txt
+mv tmp.txt rareSKAT.setID
+
+
+
+
+########################### MAKE synonymous variants setID ######################
+#filter for the variants where they have synonymous
+filter_vep -i SNPanno.vcf.gz -o LOF.txt -filter "Consequence is synonymous_variant" --only_matched
+tail -n +5 LOF.txt | awk '{print $3}' > LOFvariants.txt
+
+
+#get the test alleles
+tail -n +5 LOF.txt | cut -f8 | cut -d'|' -f1 | sed 's/CSQ=//g' > LOFtestedalleles.txt
+
+paste LOFvariants.txt LOFtestedalleles.txt > LOFvariantsAlleles.txt
+mv LOFvariantsAlleles.txt SYNvariantsAlleles.txt
+
+#make the snpmap 
+tail -n +5 LOF.txt | awk -v OFS="" '{print $3,"|",$8}' | sed 's/,/|/g' | cut -d'|' -f 1,$(seq 4 3 1200 | tr '\n' ',' | sed 's/,$//g') | sed 's/|/ /g' > VEPsnpmapwide.txt
+
+#see how many columns
+col=$(awk '{print NF}' VEPsnpmapwide.txt | sort -nu | tail -n 1)
+echo $col
+#95
+cut -d' ' -f$col VEPsnpmapwide.txt | sort | uniq
+
+Rscript makelongVEP.R VEPsnpmapwide.txt $col VEPsnpmaplong.txt
+
+gzip VEPsnpmapwide.txt
+gzip VEPsnpmaplong.txt
+
+##give the full allele tested name 
+sed 's/:/\t/g' SYNvariantsAlleles.txt | sed 's/_/\t/g' | awk '{l=length($4)-length($5);if (l==1) print $1,$2,$3,$4,$4,$5; else print $1,$2,$3,$4,$5,$5}' | awk '{if ($6=="-") print $1,$2,$3,$4,$3; else print $1,$2,$3,$4,$5}' | sed 's/ /:/1' | sed 's/ /:/1' | sed 's/ /_/1' > SYNvariantsAlleles.txt1
+
+mv SYNvariantsAlleles.txt incorrectA2SYNvariantsAlleles.txt
+mv SYNvariantsAlleles.txt1 SYNvariantsAlleles.txt
+
+
+#make setID
+zcat VEPsnpmaplong.txt.gz | grep -w -f rarevariants.txt > rareSKAT.setID
+
+
+
+
+
+
+
+
+

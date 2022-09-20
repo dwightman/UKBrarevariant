@@ -1,0 +1,425 @@
+######### example script for SKAT analysis ###############################
+#Includes main SKAT-O analysis and all SKAT-O analyses which included modifications (APOE conditioned, singletons removed, mac<5 removed, all highlighted variants removed, gene-set analyses), and the single variant analyses using plink
+
+
+################## SKAT-O ################################
+
+#replace long names in bim file to match the setIDs
+awk '{print $1}' longsnpnamescode.txt > toolongsnpnames.txt
+awk '{print $2}' longsnpnamescode.txt > trimmedsnpnames.txt
+
+awk '
+    FILENAME == ARGV[1] { listA[$1] = FNR; next }
+    FILENAME == ARGV[2] { listB[FNR] = $1; next }
+    {
+        for (i = 1; i <= NF; i++) {
+            if ($i in listA) {
+                $i = listB[listA[$i]]
+            }
+        }
+        print
+    }
+' toolongsnpnames.txt trimmedsnpnames.txt e200k.bim > tmp.txt
+mv tmp.txt e200k.bim
+
+#add phenotype to plink file
+plink --bfile e200k --pheno ADproxyQCphenotyped.txt --make-bed --out trim
+rm e200k*
+
+#make Rscript for SKAT
+cat >  SKAT.R << END
+args = commandArgs(trailingOnly=TRUE)
+library(data.table)
+library(SKAT)
+File.Bed<-"./trim.bed"
+File.Bim<-"./trim.bim"
+File.Fam<-"./trim.fam"
+File.SetID<-args[1]
+File.SSD<-"./trim.SSD"
+File.Info<-"./trim.SSD.info"
+
+Generate_SSD_SetID(File.Bed, File.Bim, File.Fam, File.SetID, File.SSD, File.Info)
+SSD.INFO<-Open_SSD(File.SSD, File.Info)
+
+# Number of Sets
+SSD.INFO$nSets
+
+# Number of samples
+SSD.INFO$nSample
+
+#covar
+File.Cov<-"./trim.cov"
+FAM_Cov<-Read_Plink_FAM_Cov(File.Fam, File.Cov, Is.binary=FALSE)
+wesbatch01 = FAM_Cov$wesbatch01
+sex = FAM_Cov$sex
+age = FAM_Cov$age
+pc1 = FAM_Cov$pop_pc1
+pc2 = FAM_Cov$pop_pc2
+pc3 = FAM_Cov$pop_pc3
+pc4 = FAM_Cov$pop_pc4
+pc5 = FAM_Cov$pop_pc5
+pc6 = FAM_Cov$pop_pc6
+pc7 = FAM_Cov$pop_pc7
+pc8 = FAM_Cov$pop_pc8
+pc9 = FAM_Cov$pop_pc9
+pc10 = FAM_Cov$pop_pc10
+
+FAM<-Read_Plink_FAM(File.Fam, Is.binary=FALSE)
+y<-FAM$Phenotype
+
+print("null model")
+#adjust for kinship in null model
+obj<-SKAT_Null_Model(y ~ wesbatch01 + sex + age + pc1 + pc2 + pc3 + pc4 + pc5 + pc6 + pc7 + pc8 + pc9 + pc10, out_type="C", Adjustment=FALSE)
+
+print("run SKAT")
+#run SKAT
+out<-SKAT.SSD.All(SSD.INFO, obj, method="SKATO")
+res<-out$results
+fwrite(res, file=paste(args[1],"SKATresults.txt",sep=""), col.names=T, row.names=F, quote=F, na=NA, sep=" ")
+
+summary(warnings())
+END
+
+Rscript SKAT.R rareSKAT.setID
+
+
+
+####calculate cumulative allele frequency threshold #############################
+#need temporary skat setID file with full snp names
+grep -w -f rarevariants.txt LOFmissense.txt > tmp
+
+cat >  CAF.R << END
+library(data.table)
+frq<-fread("e200knoMissing.frq.gz", header=T)[,c(2,5)]
+sk<-fread("tmp",header=F)
+#overlap snps
+frq<-frq[frq$SNP %in% sk$V2,]
+dim(frq)
+#3712943      2
+dim(sk)
+#3779685      2
+
+#merge the af by the snp id so each snp has a frequency
+sk<-merge(sk,frq,by.x="V2",by.y="SNP",all.x=TRUE, no.dups=TRUE)
+#calculate the sum of variant MAF for each gene
+geneCAF<-aggregate(sk$MAF, by=list(Genes=sk$V1), FUN=sum)
+colnames(geneCAF)<-c("Genes", "CAF")
+fwrite(geneCAF, file="GeneCAF.txt", sep=" ", row.names=F, col.names=T, na=NA, quote=F) 
+END
+
+Rscript CAF.R
+
+#find genes that have a CAF >0.0001
+tail -n +2 GeneCAF.txt | awk '{if ($2>0.0001) print $1}' > GENESwithgoodCAF.txt
+
+
+### repeat this process for pLOF+REVEL, pLOF, and HICpLOF and synonymous variants
+
+
+
+######## sort results
+#annotate and sort the results
+
+cat >  sort.R << END
+library(data.table)
+library(biomaRt)
+library(qdap)
+
+#read in full results, order and annotate
+a<-fread("rareSKAT.setIDSKATresults.txt", header=F)
+colnames(a)<-c("GENE","P","MarkerN","MarkerNTEST")
+
+a<-a[order(a$P),]
+ensembl <- useEnsembl(biomart="ensembl", dataset="hsapiens_gene_ensembl", GRCh=38, version=102)
+en<-getBM(attributes = c("ensembl_gene_id","external_gene_name"), mart = ensembl, filter = 'ensembl_gene_id', values =a$GENE)
+a$genename<- mgsub(en$ensembl_gene_id,en$external_gene_name,a$GENE)
+fwrite(a, file="SKATresSorted.txt", col.names=T, row.names=F, quote=F, sep=" ", na=NA)
+
+#read in good caf file and order and give colnames
+b<-fread("GENESwithgoodCAF.txt", header=F)
+a<-a[a$GENE %in% b$V1,]
+
+#give gene names
+fwrite(a, file="GOODCAFSKATres.txt", col.names=T, row.names=F, quote=F, sep=" ", na=NA)
+#calculate lambda
+chisq <- qchisq(1-a$P,1)
+lambda = median(chisq)/qchisq(0.5,1)
+lambda
+
+END
+
+Rscript sort.R
+
+
+cat > calculateFDR.R < END
+library(data.table)
+#loftee
+a<-fread("HiCLOF/GOODCAFSKATres.txt")
+a$FDR <- p.adjust(a$P, method="BH")
+fwrite(a[a$FDR<0.2,], file="lofteeFDR.txt", sep=" ", na=NA, quote=F, col.names=T, row.names=F)
+#LOF
+a<-fread("LOF/GOODCAFSKATres.txt")
+a$FDR <- p.adjust(a$P, method="BH")
+fwrite(a[a$FDR<0.2,], file="lofFDR.txt", sep=" ", na=NA, quote=F, col.names=T, row.names=F)
+#REVEL
+a<-fread("REVEL/GOODCAFSKATres.txt")
+a$FDR <- p.adjust(a$P, method="BH")
+fwrite(a[a$FDR<0.2,], file="revelFDR.txt", sep=" ", na=NA, quote=F, col.names=T, row.names=F)
+a[a$FDR<0.1,]$genename
+#MISSENSE
+a<-fread("missense/GOODCAFSKATres.txt")
+a$FDR <- p.adjust(a$P, method="BH")
+fwrite(a[a$FDR<0.2,], file="missenseFDR.txt", sep=" ", na=NA, quote=F, col.names=T, row.names=F)
+a[a$FDR<0.1,]$genename
+END
+Rscript calculateFDR.R
+
+
+
+
+
+
+######################## REPEAT SKAT ANALYSIS BUT WITHOUT CERTAIN VARIANTS ############
+
+
+####Singletons removed
+
+#find variants with MAC=1 from e200knoMissing.frq
+#then remove these variants from the setID
+#make sure that the setID is the one which includes long snp names before shortenig
+
+grep -v -w -f singletons.txt rareSKAT.setID > NoSingletonsrareSKAT.setID
+
+#re-run SKAT-O with this setID (NoSingletonsrareSKAT.setID)
+
+#Repeat process but with MAC<5
+grep -v -w -f MAClt5.txt rareSKAT.setID > NoMAClt5rareSKAT.setID
+
+#also without highlighted variants
+#grep -v -w -f highlightedVariants.txt rareSKAT.setID > NoVrareSKAT.setID
+
+
+######################## REPEAT SKAT ANALYSIS with APOE e4 as covar ############
+
+#get apoe genotypes
+cat > variantsofinterest.txt < END
+19:44908684:C_T C
+19:44908822:C_T C
+END
+
+cat > Allelesvariantsofinterest.txt < END
+19:44908684:C_T C
+19:44908822:C_T C
+END
+
+#get plink raw file
+plink --bfile e200k --pheno ADproxyQCphenotyped.txt --extract variantsofinterest.txt --make-bed --out variantsofinterest
+plink --bfile variantsofinterest --prune --recode A --recode-allele Allelesvariantsofinterest.txt --out variantsofinterestraw
+
+###### add APOE E4 to covariate file
+
+cat > apoecovar.R < END
+library(data.table)
+a<-fread("variantsofinterestraw.raw")
+c<-fread("trim.cov")
+c<-c[c$FID %in% a$FID,]
+all(a$FID==c$FID)
+colnames(a)[16]<-"a1"
+colnames(a)[17]<-"a2"
+
+a[is.na(a)]<- -1000
+
+a$APOE4<-0
+a$APOE4[a$a1>0]<-a$APOE4[a$a1>0]+1
+a$APOE4[a$a2>0]<-a$APOE4[a$a2>0]+1
+
+a$APOE4[a$a1<0]<- NA
+a$APOE4[a$a2<0]<- NA
+a$APOE4[a$APOE4<2]<-0
+a$APOE4[a$APOE4==2]<-1
+
+c$APOE4<-a$APOE4
+fwrite(c, file="APOEcov.cov", sep=" ", col.names=T, row.names=F, quote=F, na=NA) 
+END
+
+Rscript apoecovar.R
+
+
+#RUN SKAT-O 2 times using setID from pLOF+REVEL>50 and pLOF+missense
+cat > SKAT.R < END
+library(data.table)
+library(SKAT)
+File.Bed<-"./trim.bed"
+File.Bim<-"./trim.bim"
+File.Fam<-"./trim.fam"
+File.SetID<-"./rareSKAT.setID"
+File.SSD<-"./trim.SSD"
+File.Info<-"./trim.SSD.info"
+
+Generate_SSD_SetID(File.Bed, File.Bim, File.Fam, File.SetID, File.SSD, File.Info)
+SSD.INFO<-Open_SSD(File.SSD, File.Info)
+
+# Number of Sets
+SSD.INFO$nSets
+
+# Number of samples
+SSD.INFO$nSample
+
+#covar
+File.Cov<-"./APOEcov.cov"
+FAM_Cov<-Read_Plink_FAM_Cov(File.Fam, File.Cov, Is.binary=FALSE)
+wesbatch01 = FAM_Cov$wesbatch01
+sex = FAM_Cov$sex
+age = FAM_Cov$age
+APOE4 = FAM_Cov$APOE4
+pc1 = FAM_Cov$pop_pc1
+pc2 = FAM_Cov$pop_pc2
+pc3 = FAM_Cov$pop_pc3
+pc4 = FAM_Cov$pop_pc4
+pc5 = FAM_Cov$pop_pc5
+pc6 = FAM_Cov$pop_pc6
+pc7 = FAM_Cov$pop_pc7
+pc8 = FAM_Cov$pop_pc8
+pc9 = FAM_Cov$pop_pc9
+pc10 = FAM_Cov$pop_pc10
+
+FAM<-Read_Plink_FAM(File.Fam, Is.binary=FALSE)
+y<-FAM$Phenotype
+
+print("null model")
+#adjust for kinship in null model
+obj<-SKAT_Null_Model(y ~ wesbatch01 + sex + age + APOE4 + pc1 + pc2 + pc3 + pc4 + pc5 + pc6 + pc7 + pc8 + pc9 + pc10, out_type="C", Adjustment=FALSE)
+
+#10 people excluded because of NA in the APOE4 column
+
+print("run SKAT")
+#run SKAT
+out<-SKAT.SSD.All(SSD.INFO, obj, method="SKATO")
+res<-out$results
+fwrite(res, file="apoeconditionSKATresults.txt", col.names=T, row.names=F, quote=F, na=NA, sep=" ")
+summary(warnings())
+END
+
+Rscript SKAT.R
+
+
+
+######### gene-set SKAT-O analyses ###################################################
+#use the gene-set definition file from FUMA v1.3.7 (magma_GS.txt)
+
+
+#make the setIDs for each gene-set then we can run SKAT per gene-set
+#need to make file name and first line the gene-set name
+#make name dictionary for gs name and the gs number
+#make gs names in setID gs1..gsN to keep them short
+
+rm genesets.setID
+rm gscode.txt
+count=1
+cat magma_GS.txt | while read i; do echo $count; echo $i | cut -d' ' -f1 | sed "s/$/ gs$count/" >> gscode.txt; echo $i | cut -d' ' -f2- | tr ' ' '\n' > grp.txt; sk=$(echo 'gs' | sed "s/$/$count/"); grep -w -f grp.txt rareSKAT.setID | awk -v gs="$sk" '{print gs,$2}' | sort | uniq >> genesets.setID; let "count+=1"; done 
+
+#restrict to gene-sets with <10k variants so R can handle the gene-set analysis
+zcat genesets.setID.gz | awk '{print $1}' | sort | uniq -c > GeneSetVariantCounts.txt
+
+awk '{if ($1<10000) print $2}' GeneSetVariantCounts.txt > GeneSetswithlt10kvariants.txt
+
+zcat genesets.setID.gz | grep -w -f GeneSetswithlt10kvariants.txt > lt10genesets.setID
+
+#repeat SKAT-O analyses except using this setID
+
+
+
+########## re-run 33 sig gene-sets without APOE region
+#APOE 19:40000000-50000000
+
+#list 33 sig genesets in siggeneset.txt
+
+#make a new setID with those gene-sets with the APOE variants removed
+grep -w -f siggeneset.txt lt10genesets.setID > siggeneset.setID
+awk '{print $1}' siggeneset.setID | sort | uniq | wc -l
+#33
+
+#find which gene-sets have apoe variants
+grep "19:4.......:" siggeneset.setID | awk '{print $1}' | sort | uniq > genesetswithAPOE.txt
+
+#remove variants with APOE or variants in the region (19:40000000-50000000)
+grep -v "19:4.......:" siggeneset.setID | grep -w -f genesetswithAPOE.txt > NoAPOEsiggeneset.setID
+
+#RE-RUN SKAT-O analyses with this setID
+
+
+
+#re-run the 33 sig gene-sets with APOE and sig regions excluded
+grep "ENSG00000137642" rareSKAT.setID | awk '{print $2}' > variantsinsiggenes.txt
+grep "ENSG00000213614" rareSKAT.setID | awk '{print $2}' >> variantsinsiggenes.txt
+grep "ENSG00000095970" rareSKAT.setID | awk '{print $2}' >> variantsinsiggenes.txt
+
+grep -w -v -f variantsinsiggenes.txt siggeneset.setID | grep -v "19:4.......:" > NoSigNoAPOEsiggeneset.setID
+
+
+#RE-RUN SKAT-O analyses with this setID
+
+
+############################## Gene-sets of previous AD genes ########################
+
+#get previous AD genes through rare variants, exclude APOE
+cat  > rareADgenes.txt < END
+TREM2
+SORL1
+APP
+PSEN1
+PSEN2
+ABCA7
+BIN1
+UNC5C
+AKAP9
+NOTCH3
+CLU
+PLGC2
+PLD3
+ADAM10
+ABI3
+END
+
+#get ENSG names 
+grep -w -f rareADgenes.txt GOODCAFSKATres.txt | awk '{print $1}' > ENSG.txt
+
+#make setIDs for the 4 variant categories (HiCpLOF, pLOF, pLOF+REVEL, pLOF+missense) for these genes except TREM2 and SORL1
+grep -w -f ENSG.txt missense/rareSKAT.setID | grep -v -w "ENSG00000095970" | grep -v -w "ENSG00000137642" > Missensereplicated.setID 
+#repeat for the other categories and run SKAT-O with this setID
+
+
+#repeat but with out ABCA7
+grep -v -w "ENSG00000064687" Missensereplicated.setID > NoABCA7Missensereplicated.setID
+#repeat for the other categories and run SKAT-O with this setID
+
+
+
+
+####common genes from Bellenguez
+#repeat above except replace rareADgenes.txt with the the genes from table1 of bellenguez et al. 2022
+#repeat above except replace rareADgenes.txt with the the genes from table2 of bellenguez et al. 2022
+#also repeat without ABCA7 for the common genes
+
+
+
+
+########################## SINGLE VARIANT ANALYSES #############################
+#make list of genes that need to be studied in genelist.txt
+
+#only use variants in genelist.txt
+grep -w -f genelist.txt  LOFcount.setID | cut -d' ' -f2 > variants.txt
+
+#trim and analyse with same covariates as SKAT-O
+plink --bfile trim --prune --extract variants.txt --make-bed --out 1trim
+plink --bfile 1trim --linear hide-covar --ci 0.95 --covar trim.cov --out trim
+plink --bfile 1trim --freq --out trimfrq
+
+#sex interaction
+plink --bfile trim --linear interaction --ci 0.95 --covar trim.cov --out SexInteraction --parameters 1-15,29
+
+
+
+
+
+
